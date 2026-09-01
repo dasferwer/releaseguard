@@ -1,0 +1,103 @@
+name: 09-releaseguard
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://releaseguard:releaseguard@database:5432/releaseguard}
+    WEBHOOK_SECRET: ${WEBHOOK_SECRET:-change-me-in-production}
+    CANARY_TIMEOUT_SECONDS: ${CANARY_TIMEOUT_SECONDS:-300}
+    RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-2}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  depends_on:
+    database:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  database:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-releaseguard}
+      POSTGRES_USER: ${POSTGRES_USER:-releaseguard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-releaseguard}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-releaseguard} -d ${POSTGRES_DB:-releaseguard}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  api:
+    <<: *app
+    command: ["uvicorn", "releaseguard.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8091:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  reconciler:
+    <<: *app
+    command: ["python", "-m", "releaseguard.reconciler"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=2d"]
+    volumes:
+      - ./observability/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9099:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-releaseguard}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3009:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  test:
+    <<: *app
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    command: ["pytest"]
+    restart: "no"
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:

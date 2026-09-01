@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "releaseguard.fullname" . }}-reconciler
+  labels:
+    {{- include "releaseguard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reconciler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "releaseguard.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: reconciler
+  template:
+    metadata:
+      labels:
+        {{- include "releaseguard.labels" . | nindent 8 }}
+        app.kubernetes.io/component: reconciler
+    spec:
+      serviceAccountName: {{ include "releaseguard.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reconciler
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "releaseguard.reconciler"]
+          envFrom:
+            - configMapRef:
+                name: {{ include "releaseguard.fullname" . }}
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+

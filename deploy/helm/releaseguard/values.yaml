@@ -1,0 +1,43 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/example/releaseguard
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: ""
+
+service:
+  type: ClusterIP
+  port: 80
+
+config:
+  logLevel: INFO
+  canaryTimeoutSeconds: 300
+  reconcileIntervalSeconds: 2
+
+existingSecret: releaseguard-secrets
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+

@@ -1,0 +1,23 @@
+groups:
+  - name: releaseguard
+    rules:
+      - alert: ReleaseGuardDown
+        expr: up{job="releaseguard"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: ReleaseGuard API is unavailable
+      - alert: RollbackRateHigh
+        expr: increase(releaseguard_canary_decisions_total{decision="rollback"}[15m]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: Three or more canaries rolled back within 15 minutes
+      - alert: ReleaseWebhookSignatureFailures
+        expr: increase(releaseguard_webhooks_total{result="invalid_signature"}[10m]) >= 5
+        labels:
+          severity: warning
+        annotations:
+          summary: Repeated invalid CI webhook signatures
+

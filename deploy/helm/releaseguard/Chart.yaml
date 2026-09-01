@@ -1,0 +1,7 @@
+apiVersion: v2
+name: releaseguard
+description: Policy-driven release control plane
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
