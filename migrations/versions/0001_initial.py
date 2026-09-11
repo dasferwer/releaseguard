@@ -1,4 +1,4 @@
-"""Create ReleaseGuard schema.
+"""Создаём таблицы релизов, проверок и развёртываний.
 
 Revision ID: 0001
 Revises:
