@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import datetime
 
@@ -9,14 +10,20 @@ from releaseguard.domain import GateStatus, ReleaseStatus
 class ApplicationCreate(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     slug: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", max_length=80)
-    required_gates: list[str] = Field(default_factory=lambda: ["tests", "security", "signature"])
+    required_gates: list[str] = Field(
+        default_factory=lambda: ["tests", "security", "signature"], min_length=1, max_length=10
+    )
 
     @field_validator("required_gates")
     @classmethod
     def unique_gates(cls, value: list[str]) -> list[str]:
         normalized = [item.strip().lower() for item in value if item.strip()]
+        if len(normalized) != len(value) or any(
+            re.fullmatch(r"[a-z][a-z0-9_-]*", item) is None for item in normalized
+        ):
+            raise ValueError("Названия проверок должны содержать латинские буквы, цифры, _ или -")
         if len(normalized) != len(set(normalized)):
-            raise ValueError("required_gates must be unique")
+            raise ValueError("Названия проверок не должны повторяться")
         return normalized
 
 
@@ -31,7 +38,7 @@ class EnvironmentCreate(BaseModel):
     name: str = Field(min_length=2, max_length=80)
     requires_approval: bool = True
     min_requests: int = Field(default=100, ge=1, le=1_000_000)
-    max_error_rate: float = Field(default=0.02, ge=0, le=1)
+    max_error_rate: float = Field(default=0.02, ge=0, le=1, allow_inf_nan=False)
     max_p95_ms: int = Field(default=800, ge=1, le=120_000)
 
 
@@ -78,18 +85,13 @@ class GateWebhook(BaseModel):
     details: dict[str, object] = Field(default_factory=dict)
 
 
-class ApprovalCreate(BaseModel):
-    actor: str = Field(min_length=3, max_length=160)
-
-
 class DeployCreate(BaseModel):
-    actor: str = Field(min_length=3, max_length=160)
     canary_percent: int = Field(default=10, ge=1, le=50)
 
 
 class ObservationCreate(BaseModel):
     request_count: int = Field(ge=0)
-    error_rate: float = Field(ge=0, le=1)
+    error_rate: float = Field(ge=0, le=1, allow_inf_nan=False)
     p95_ms: int = Field(ge=0, le=120_000)
 
 

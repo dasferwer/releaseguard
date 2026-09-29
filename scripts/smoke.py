@@ -3,21 +3,30 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
+import time
 import urllib.error
 import urllib.request
 import uuid
 
-BASE_URL = "http://localhost:8091"
-SECRET = "change-me-in-production"
+BASE_URL = os.environ.get("RELEASEGUARD_SMOKE_URL", "http://localhost:8091")
+SECRET = os.environ.get("RELEASEGUARD_WEBHOOK_SECRET", "change-me-in-production")
+KEYS = {
+    "admin": os.environ.get("RELEASEGUARD_ADMIN_KEY", "local-admin-key-change-me"),
+    "approver": os.environ.get("RELEASEGUARD_APPROVER_KEY", "local-approver-key-change-me"),
+    "observer": os.environ.get("RELEASEGUARD_OBSERVER_KEY", "local-observer-key-change-me"),
+}
 
 
-def request(method: str, path: str, payload: dict[str, object] | None = None) -> dict[str, object]:
+def request(
+    method: str, path: str, payload: dict[str, object] | None = None, *, role: str = "admin"
+) -> dict[str, object]:
     body = json.dumps(payload, separators=(",", ":")).encode() if payload is not None else None
     req = urllib.request.Request(
         BASE_URL + path,
         data=body,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + KEYS[role]},
     )
     with urllib.request.urlopen(req, timeout=10) as response:
         return json.loads(response.read())
@@ -40,12 +49,21 @@ def signed_gate(payload: dict[str, object]) -> dict[str, object]:
 
 
 def main() -> None:
+    for _ in range(40):
+        try:
+            request("GET", "/ready")
+            break
+        except (urllib.error.URLError, ConnectionError):
+            time.sleep(0.5)
+    else:
+        raise TimeoutError("API не стала доступной вовремя")
+
     suffix = uuid.uuid4().hex[:8]
     application = request(
         "POST",
         "/api/v1/applications",
         {
-            "name": "Checkout API",
+            "name": "API заказов",
             "slug": f"checkout-{suffix}",
             "required_gates": ["tests", "security", "signature"],
         },
@@ -81,19 +99,18 @@ def main() -> None:
             }
         )
     assert release["status"] == "awaiting_approval", release
-    release = request(
-        "POST", f"/api/v1/releases/{release['id']}/approve", {"actor": "oncall@example.com"}
-    )
+    release = request("POST", f"/api/v1/releases/{release['id']}/approve", role="approver")
     release = request(
         "POST",
         f"/api/v1/releases/{release['id']}/deploy",
-        {"actor": "deploy-bot", "canary_percent": 10},
+        {"canary_percent": 10},
     )
     assert release["status"] == "canary", release
     release = request(
         "POST",
         f"/api/v1/releases/{release['id']}/observations",
         {"request_count": 500, "error_rate": 0.002, "p95_ms": 240},
+        role="observer",
     )
     assert release["status"] == "succeeded", release
     events = request("GET", f"/api/v1/releases/{release['id']}/events")
@@ -119,19 +136,18 @@ def main() -> None:
             }
         )
     failing_release = request(
-        "POST",
-        f"/api/v1/releases/{failing_release['id']}/approve",
-        {"actor": "oncall@example.com"},
+        "POST", f"/api/v1/releases/{failing_release['id']}/approve", role="approver"
     )
     failing_release = request(
         "POST",
         f"/api/v1/releases/{failing_release['id']}/deploy",
-        {"actor": "deploy-bot", "canary_percent": 10},
+        {"canary_percent": 10},
     )
     failing_release = request(
         "POST",
         f"/api/v1/releases/{failing_release['id']}/observations",
         {"request_count": 500, "error_rate": 0.12, "p95_ms": 240},
+        role="observer",
     )
     assert failing_release["status"] == "rolled_back", failing_release
     assert failing_release["previous_release_id"] == release["id"], failing_release

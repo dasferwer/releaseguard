@@ -25,6 +25,7 @@ resource "kubernetes_secret_v1" "releaseguard" {
   data = {
     DATABASE_URL   = var.database_url
     WEBHOOK_SECRET = var.webhook_secret
+    API_CLIENTS    = var.api_clients
   }
   type = "Opaque"
 }
@@ -48,4 +49,3 @@ resource "helm_release" "releaseguard" {
     }
   ]
 }
-

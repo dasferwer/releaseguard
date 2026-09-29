@@ -60,5 +60,5 @@ def test_canary_policy(
 
 
 def test_state_machine_rejects_skipping_canary() -> None:
-    with pytest.raises(ValueError, match="not allowed"):
+    with pytest.raises(ValueError, match="запрещён"):
         require_transition(ReleaseStatus.approved, ReleaseStatus.succeeded)

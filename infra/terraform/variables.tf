@@ -1,34 +1,39 @@
 variable "kubeconfig_path" {
-  description = "Path to a kubeconfig file"
+  description = "Путь к файлу kubeconfig"
   type        = string
   default     = "~/.kube/config"
 }
 
 variable "namespace" {
-  description = "Namespace for ReleaseGuard"
+  description = "Пространство имён ReleaseGuard"
   type        = string
   default     = "releaseguard"
 }
 
 variable "image_repository" {
-  description = "OCI repository for the application image"
+  description = "OCI-репозиторий образа приложения"
   type        = string
 }
 
 variable "image_tag" {
-  description = "Immutable application image tag"
+  description = "Неизменяемый тег образа приложения"
   type        = string
 }
 
 variable "database_url" {
-  description = "Async PostgreSQL connection URL"
+  description = "Адрес асинхронного подключения к PostgreSQL"
   type        = string
   sensitive   = true
 }
 
 variable "webhook_secret" {
-  description = "HMAC secret for CI events"
+  description = "Секрет HMAC для событий CI"
   type        = string
   sensitive   = true
 }
 
+variable "api_clients" {
+  description = "JSON с именами клиентов API, ролями и секретными ключами"
+  type        = string
+  sensitive   = true
+}

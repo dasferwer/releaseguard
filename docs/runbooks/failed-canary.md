@@ -1,16 +1,9 @@
-# Runbook: failed or timed-out canary
+# Разбор неудачной канареечной проверки
 
-1. Open the release event journal and identify `canary.observed` or
-   `canary.timeout`.
-2. Confirm that traffic is zero and the environment points to
-   `previous_release_id`.
-3. Inspect the Grafana latency/error panels and the application logs for the
-   canary window.
-4. Do not retry the same mutable tag. Fix the build and create a new immutable
-   artifact digest and idempotency key.
-5. If automatic rollback did not release the environment lock, stop new
-   deployments and reconcile the database state before manual changes.
+1. Откройте журнал релиза и найдите `canary.observed` или `canary.timeout`. Проверьте пороги и исходное наблюдение.
+2. Сверьте статус релиза, `traffic_percent`, `active_release_id` и `current_release_id` окружения с ожидаемым предыдущим релизом.
+3. Проверьте фактическую маршрутизацию и развёртывание во внешней системе. ReleaseGuard меняет только состояние в своей БД и не переключает трафик.
+4. Посмотрите метрики и журналы управляемого приложения за окно канареечной проверки. При отсутствии данных выясните, почему источник метрик не отправил наблюдение.
+5. Для повтора соберите новый артефакт с неизменяемым digest и новым ключом запроса. Не переиспользуйте прежний `event_id` для другого результата проверки.
 
-Escalate when the previous release is also unhealthy or when rollback decisions
-repeat three times in fifteen minutes.
-
+Если состояние БД расходится с фактическим развёртыванием, сначала остановите новые выпуски в этом окружении. После выяснения причины согласуйте состояние вручную; автоматический reconciler решает только случай истечения времени ожидания метрик.

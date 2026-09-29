@@ -1,7 +1,7 @@
-.PHONY: sync format lint type test check up down smoke seed helm terraform
+.PHONY: sync format lint type test integration check up down smoke seed helm terraform
 
 sync:
-	uv sync --extra dev
+	uv sync --frozen --extra dev
 
 format:
 	uv run ruff format .
@@ -17,7 +17,11 @@ type:
 test:
 	uv run pytest
 
-check: lint type test
+integration:
+	docker compose --profile test build test
+	docker compose --profile test run --rm test
+
+check: lint type test integration
 	docker compose config --quiet
 
 up:

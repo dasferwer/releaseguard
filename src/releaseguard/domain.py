@@ -62,4 +62,4 @@ def require_transition(current: ReleaseStatus, target: ReleaseStatus) -> None:
         ReleaseStatus.succeeded: {ReleaseStatus.rolled_back},
     }
     if target not in allowed.get(current, set()):
-        raise ValueError(f"transition {current.value} -> {target.value} is not allowed")
+        raise ValueError(f"Переход {current.value} → {target.value} запрещён")

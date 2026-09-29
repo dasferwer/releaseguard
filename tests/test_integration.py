@@ -1,0 +1,261 @@
+import asyncio
+import hashlib
+import hmac
+import json
+from datetime import timedelta
+from uuid import UUID, uuid4
+
+import httpx
+import pytest
+import pytest_asyncio
+from sqlalchemy import text
+
+from releaseguard.db import engine, session_factory
+from releaseguard.main import app, settings
+from releaseguard.models import Environment, Release, utcnow
+from releaseguard.reconciler import reconcile_batch
+
+pytestmark = pytest.mark.asyncio(loop_scope="session")
+
+KEYS = {
+    "admin": "local-admin-key-change-me",
+    "approver": "local-approver-key-change-me",
+    "observer": "local-observer-key-change-me",
+    "viewer": "local-viewer-key-change-me",
+}
+
+
+@pytest_asyncio.fixture(scope="module", loop_scope="session", autouse=True)
+async def clean_test_database():
+    if engine.url.database != "releaseguard_test":
+        pytest.skip("Интеграционные тесты выполняются только в releaseguard_test")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "TRUNCATE release_events, canary_observations, webhook_receipts, "
+                "gate_results, releases, environments, applications CASCADE"
+            )
+        )
+    yield
+
+
+@pytest.fixture
+def client():
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://testserver")
+
+
+def headers(role: str) -> dict[str, str]:
+    return {"Authorization": "Bearer " + KEYS[role]}
+
+
+async def make_release(
+    client: httpx.AsyncClient, environment_id: str | None = None, gates: list[str] | None = None
+):
+    if environment_id is None:
+        suffix = uuid4().hex[:8]
+        application_response = await client.post(
+            "/api/v1/applications",
+            headers=headers("admin"),
+            json={
+                "name": "Сервис заказов",
+                "slug": "orders-" + suffix,
+                "required_gates": gates or ["tests"],
+            },
+        )
+        assert application_response.status_code == 201, application_response.text
+        application = application_response.json()
+        environment_response = await client.post(
+            f"/api/v1/applications/{application['id']}/environments",
+            headers=headers("admin"),
+            json={"name": "production", "min_requests": 10},
+        )
+        assert environment_response.status_code == 201, environment_response.text
+        environment_id = environment_response.json()["id"]
+    payload = {
+        "version": uuid4().hex[:8],
+        "artifact_digest": "sha256:" + "a" * 64,
+        "idempotency_key": "deploy-" + uuid4().hex,
+    }
+    response = await client.post(
+        f"/api/v1/environments/{environment_id}/releases",
+        headers=headers("admin"),
+        json=payload,
+    )
+    assert response.status_code == 201, response.text
+    return environment_id, response.json(), payload
+
+
+async def send_gate(
+    client: httpx.AsyncClient,
+    release_id: str,
+    event_id: str,
+    status: str = "passed",
+    gate: str = "tests",
+):
+    payload = {
+        "event_id": event_id,
+        "release_id": release_id,
+        "gate": gate,
+        "status": status,
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    signature = hmac.new(settings.webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+    return await client.post(
+        "/api/v1/webhooks/ci",
+        content=body,
+        headers={"X-ReleaseGuard-Signature": "sha256=" + signature},
+    )
+
+
+async def advance_to_canary(client: httpx.AsyncClient, release_id: str):
+    response = await send_gate(client, release_id, "event-" + uuid4().hex)
+    assert response.status_code == 200, response.text
+    response = await client.post(
+        f"/api/v1/releases/{release_id}/approve",
+        headers=headers("approver"),
+        json={"actor": "подставной-пользователь"},
+    )
+    assert response.status_code == 200 and response.json()["approved_by"] == "local-approver"
+    response = await client.post(
+        f"/api/v1/releases/{release_id}/deploy",
+        headers=headers("admin"),
+        json={"actor": "подставной-пользователь", "canary_percent": 10},
+    )
+    assert response.status_code == 200 and response.json()["status"] == "canary"
+
+
+async def test_roles_webhook_and_concurrent_idempotency(client):
+    async with client:
+        assert (await client.post("/api/v1/applications", json={})).status_code == 401
+        assert (
+            await client.post(
+                "/api/v1/applications",
+                headers=headers("viewer"),
+                json={"name": "Чужое приложение", "slug": "not-allowed"},
+            )
+        ).status_code == 403
+        environment_id, release, payload = await make_release(client)
+        responses = await asyncio.gather(
+            *[
+                client.post(
+                    f"/api/v1/environments/{environment_id}/releases",
+                    headers=headers("admin"),
+                    json=payload,
+                )
+                for _ in range(5)
+            ]
+        )
+        assert all(response.status_code == 201 for response in responses)
+        assert {response.json()["id"] for response in responses} == {release["id"]}
+        assert (
+            await client.post(f"/api/v1/releases/{release['id']}/approve", headers=headers("admin"))
+        ).status_code == 403
+        assert (
+            await client.post(
+                "/api/v1/webhooks/ci",
+                content=b"{}",
+                headers={"X-ReleaseGuard-Signature": "sha256=bad"},
+            )
+        ).status_code == 401
+        event_id = "event-" + uuid4().hex
+        webhooks = await asyncio.gather(
+            send_gate(client, release["id"], event_id),
+            send_gate(client, release["id"], event_id),
+        )
+        assert all(
+            response.status_code == 200 and response.json()["status"] == "awaiting_approval"
+            for response in webhooks
+        )
+        assert (await client.get(f"/api/v1/releases/{release['id']}/events")).status_code == 401
+        events = await client.get(
+            f"/api/v1/releases/{release['id']}/events", headers=headers("viewer")
+        )
+        assert events.status_code == 200 and len(events.json()) == 3
+        await advance_existing_release(client, release["id"])
+        audit = (
+            await client.get(f"/api/v1/releases/{release['id']}/events", headers=headers("viewer"))
+        ).json()
+        assert {
+            item["actor"] for item in audit if item["event_type"] == "release.status_changed"
+        } == {
+            "policy-engine",
+            "local-approver",
+            "local-admin",
+        }
+        assert (
+            await client.post(
+                f"/api/v1/releases/{release['id']}/observations",
+                headers=headers("viewer"),
+                json={"request_count": 50, "error_rate": 0, "p95_ms": 100},
+            )
+        ).status_code == 403
+
+
+async def advance_existing_release(client: httpx.AsyncClient, release_id: str):
+    response = await client.post(
+        f"/api/v1/releases/{release_id}/approve",
+        headers=headers("approver"),
+        json={"actor": "подставной-пользователь"},
+    )
+    assert response.status_code == 200 and response.json()["approved_by"] == "local-approver"
+    response = await client.post(
+        f"/api/v1/releases/{release_id}/deploy",
+        headers=headers("admin"),
+        json={"actor": "подставной-пользователь", "canary_percent": 10},
+    )
+    assert response.status_code == 200
+
+
+async def test_old_release_cannot_rollback_new_one(client):
+    async with client:
+        environment_id, first, _ = await make_release(client)
+        await advance_to_canary(client, first["id"])
+        promoted = await client.post(
+            f"/api/v1/releases/{first['id']}/observations",
+            headers=headers("observer"),
+            json={"request_count": 50, "error_rate": 0.001, "p95_ms": 100},
+        )
+        assert promoted.status_code == 200 and promoted.json()["status"] == "succeeded"
+        _, second, _ = await make_release(client, environment_id)
+        await advance_to_canary(client, second["id"])
+        promoted = await client.post(
+            f"/api/v1/releases/{second['id']}/observations",
+            headers=headers("observer"),
+            json={"request_count": 50, "error_rate": 0.001, "p95_ms": 100},
+        )
+        assert promoted.status_code == 200 and promoted.json()["status"] == "succeeded"
+        stale = await client.post(
+            f"/api/v1/releases/{first['id']}/rollback", headers=headers("admin")
+        )
+        assert stale.status_code == 409
+        async with session_factory() as session:
+            environment = await session.get(Environment, UUID(environment_id))
+            assert environment.current_release_id == UUID(second["id"])
+
+
+async def test_reported_gate_cannot_be_overwritten(client):
+    async with client:
+        _, release, _ = await make_release(client, gates=["tests", "security"])
+        first = await send_gate(client, release["id"], "event-" + uuid4().hex)
+        assert first.status_code == 200 and first.json()["status"] == "evaluating"
+        changed = await send_gate(client, release["id"], "event-" + uuid4().hex, "failed")
+        assert changed.status_code == 409
+        second = await send_gate(client, release["id"], "event-" + uuid4().hex, gate="security")
+        assert second.status_code == 200 and second.json()["status"] == "awaiting_approval"
+
+
+async def test_reconciler_rolls_back_only_own_canary(client):
+    async with client:
+        environment_id, release, _ = await make_release(client)
+        await advance_to_canary(client, release["id"])
+        async with session_factory.begin() as session:
+            stored = await session.get(Release, UUID(release["id"]))
+            stored.canary_started_at = utcnow() - timedelta(
+                seconds=settings.canary_timeout_seconds + 1
+            )
+        assert await reconcile_batch() == 1
+        current = await client.get(f"/api/v1/releases/{release['id']}", headers=headers("viewer"))
+        assert current.status_code == 200 and current.json()["status"] == "rolled_back"
+        async with session_factory() as session:
+            environment = await session.get(Environment, UUID(environment_id))
+            assert environment.active_release_id is None

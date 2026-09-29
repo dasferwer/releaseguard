@@ -7,12 +7,13 @@ x-app: &app
   env_file:
     - path: .env
       required: false
-  environment:
+  environment: &app-environment
     DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://releaseguard:releaseguard@database:5432/releaseguard}
     WEBHOOK_SECRET: ${WEBHOOK_SECRET:-change-me-in-production}
     CANARY_TIMEOUT_SECONDS: ${CANARY_TIMEOUT_SECONDS:-300}
     RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-2}
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    API_CLIENTS: '${API_CLIENTS:-{"local-admin":{"key":"local-admin-key-change-me","role":"admin"},"local-approver":{"key":"local-approver-key-change-me","role":"approver"},"local-observer":{"key":"local-observer-key-change-me","role":"observer"},"local-viewer":{"key":"local-viewer-key-change-me","role":"viewer"}}}'
   depends_on:
     database:
       condition: service_healthy
@@ -46,7 +47,7 @@ services:
       migrate:
         condition: service_completed_successfully
     ports:
-      - "8091:8000"
+      - "127.0.0.1:8091:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -67,7 +68,7 @@ services:
       - ./observability/prometheus:/etc/prometheus:ro
       - prometheus_data:/prometheus
     ports:
-      - "9099:9090"
+      - "127.0.0.1:9099:9090"
     depends_on:
       api:
         condition: service_healthy
@@ -83,7 +84,7 @@ services:
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana_data:/var/lib/grafana
     ports:
-      - "3009:3000"
+      - "127.0.0.1:3009:3000"
     depends_on:
       - prometheus
     restart: unless-stopped
@@ -94,8 +95,28 @@ services:
     build:
       context: .
       target: test
-    command: ["pytest"]
+    environment:
+      <<: *app-environment
+      DATABASE_URL: postgresql+asyncpg://releaseguard:releaseguard@database-test:5432/releaseguard_test
+      API_CLIENTS: '{"local-admin":{"key":"local-admin-key-change-me","role":"admin"},"local-approver":{"key":"local-approver-key-change-me","role":"approver"},"local-observer":{"key":"local-observer-key-change-me","role":"observer"},"local-viewer":{"key":"local-viewer-key-change-me","role":"viewer"}}'
+    depends_on:
+      database-test:
+        condition: service_healthy
+    command: ["sh", "-c", "alembic upgrade head && pytest"]
     restart: "no"
+
+  database-test:
+    image: postgres:17-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_DB: releaseguard_test
+      POSTGRES_USER: releaseguard
+      POSTGRES_PASSWORD: releaseguard
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U releaseguard -d releaseguard_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
 
 volumes:
   postgres_data:

@@ -9,11 +9,12 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import ValidationError
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import RequestResponseEndpoint
 
+from releaseguard.auth import Admin, Approver, Observer, Reader
 from releaseguard.config import get_settings
 from releaseguard.db import engine, get_session
 from releaseguard.domain import CanaryDecision, ReleaseStatus, evaluate_canary
@@ -38,7 +39,6 @@ from releaseguard.models import (
 from releaseguard.schemas import (
     ApplicationCreate,
     ApplicationRead,
-    ApprovalCreate,
     DeployCreate,
     EnvironmentCreate,
     EnvironmentRead,
@@ -69,7 +69,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="ReleaseGuard API",
     version="0.1.0",
-    description="Policy-driven release gates, canary verification and automatic rollback.",
+    description="Управление проверками релиза, канареечным запуском и откатом.",
     lifespan=lifespan,
 )
 
@@ -96,19 +96,27 @@ async def ready(session: SessionDep) -> dict[str, str]:
 
 
 @app.get("/metrics", include_in_schema=False)
-async def metrics() -> Response:
+async def metrics(session: SessionDep) -> Response:
+    active = await session.scalar(
+        select(func.count())
+        .select_from(Environment)
+        .where(Environment.active_release_id.is_not(None))
+    )
+    ACTIVE_RELEASES.set(active or 0)
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/api/v1/applications", response_model=ApplicationRead, status_code=201)
-async def create_application(payload: ApplicationCreate, session: SessionDep) -> Application:
+async def create_application(
+    payload: ApplicationCreate, session: SessionDep, principal: Admin
+) -> Application:
     application = Application(**payload.model_dump())
     session.add(application)
     try:
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(status_code=409, detail="application slug already exists") from exc
+        raise HTTPException(status_code=409, detail="Адрес приложения уже занят") from exc
     await session.refresh(application)
     return application
 
@@ -119,17 +127,17 @@ async def create_application(payload: ApplicationCreate, session: SessionDep) ->
     status_code=201,
 )
 async def create_environment(
-    application_id: uuid.UUID, payload: EnvironmentCreate, session: SessionDep
+    application_id: uuid.UUID, payload: EnvironmentCreate, session: SessionDep, principal: Admin
 ) -> Environment:
     if await session.get(Application, application_id) is None:
-        raise HTTPException(status_code=404, detail="application not found")
+        raise HTTPException(status_code=404, detail="Приложение не найдено")
     environment = Environment(application_id=application_id, **payload.model_dump())
     session.add(environment)
     try:
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise HTTPException(status_code=409, detail="environment already exists") from exc
+        raise HTTPException(status_code=409, detail="Окружение уже существует") from exc
     await session.refresh(environment)
     return environment
 
@@ -140,8 +148,11 @@ async def create_environment(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_release(
-    environment_id: uuid.UUID, payload: ReleaseCreate, session: SessionDep
+    environment_id: uuid.UUID, payload: ReleaseCreate, session: SessionDep, principal: Admin
 ) -> Release:
+    environment = await lock_environment(session, environment_id)
+    if environment is None:
+        raise HTTPException(status_code=404, detail="Окружение не найдено")
     existing = await session.scalar(
         select(Release).where(
             Release.environment_id == environment_id,
@@ -153,14 +164,13 @@ async def create_release(
             existing.artifact_digest != payload.artifact_digest
             or existing.version != payload.version
         ):
-            raise HTTPException(status_code=409, detail="idempotency key reused with new payload")
+            raise HTTPException(
+                status_code=409, detail="Ключ повторного запроса использован с другими данными"
+            )
         return existing
 
-    environment = await lock_environment(session, environment_id)
-    if environment is None:
-        raise HTTPException(status_code=404, detail="environment not found")
     if environment.active_release_id is not None:
-        raise HTTPException(status_code=409, detail="environment already has an active release")
+        raise HTTPException(status_code=409, detail="В окружении уже есть активный релиз")
 
     release = Release(
         application_id=environment.application_id,
@@ -177,21 +187,20 @@ async def create_release(
         session,
         release,
         "release.created",
-        "api",
+        principal.name,
         {"version": release.version, "artifact_digest": release.artifact_digest},
     )
     await session.commit()
     await session.refresh(release)
     RELEASES_CREATED.inc()
-    ACTIVE_RELEASES.inc()
     return release
 
 
 @app.get("/api/v1/releases/{release_id}", response_model=ReleaseRead)
-async def get_release(release_id: uuid.UUID, session: SessionDep) -> Release:
+async def get_release(release_id: uuid.UUID, session: SessionDep, principal: Reader) -> Release:
     release = await session.get(Release, release_id)
     if release is None:
-        raise HTTPException(status_code=404, detail="release not found")
+        raise HTTPException(status_code=404, detail="Релиз не найден")
     return release
 
 
@@ -205,34 +214,35 @@ async def receive_gate_webhook(request: Request, session: SessionDep) -> Release
     body = await request.body()
     if not valid_signature(body, request.headers.get("X-ReleaseGuard-Signature")):
         WEBHOOKS.labels(result="invalid_signature").inc()
-        raise HTTPException(status_code=401, detail="invalid webhook signature")
+        raise HTTPException(status_code=401, detail="Недействительная подпись уведомления")
     try:
         payload = GateWebhook.model_validate_json(body)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
     payload_hash = hashlib.sha256(body).hexdigest()
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:event_id, 0))"),
+        {"event_id": f"webhook:{payload.event_id}"},
+    )
+    release = await lock_release(session, payload.release_id)
+    if release is None:
+        raise HTTPException(status_code=404, detail="Релиз не найден")
     receipt = await session.get(WebhookReceipt, payload.event_id)
     if receipt is not None:
         if receipt.payload_hash != payload_hash:
-            raise HTTPException(status_code=409, detail="event_id reused with new payload")
-        release = await session.get(Release, payload.release_id)
-        if release is None:
-            raise HTTPException(status_code=404, detail="release not found")
+            raise HTTPException(status_code=409, detail="ID события использован с другими данными")
         WEBHOOKS.labels(result="duplicate").inc()
         return release
 
-    release = await lock_release(session, payload.release_id)
-    if release is None:
-        raise HTTPException(status_code=404, detail="release not found")
     if release.status != ReleaseStatus.evaluating:
-        raise HTTPException(status_code=409, detail="release no longer accepts gate results")
+        raise HTTPException(status_code=409, detail="Релиз больше не принимает результаты проверок")
     application = await session.get(Application, release.application_id)
     environment = await lock_environment(session, release.environment_id)
     if application is None or environment is None:
-        raise HTTPException(status_code=409, detail="release dependencies are missing")
+        raise HTTPException(status_code=409, detail="Не найдены данные приложения или окружения")
     if payload.gate not in application.required_gates:
-        raise HTTPException(status_code=422, detail="gate is not required by application policy")
+        raise HTTPException(status_code=422, detail="Проверка не входит в политику приложения")
 
     gate = await session.scalar(
         select(GateResult).where(
@@ -248,9 +258,8 @@ async def receive_gate_webhook(request: Request, session: SessionDep) -> Release
             details=payload.details,
         )
         session.add(gate)
-    else:
-        gate.status = payload.status
-        gate.details = payload.details
+    elif gate.status != payload.status or gate.details != payload.details:
+        raise HTTPException(status_code=409, detail="Результат проверки уже зафиксирован")
     session.add(WebhookReceipt(event_id=payload.event_id, payload_hash=payload_hash))
     add_event(
         session,
@@ -271,23 +280,21 @@ async def receive_gate_webhook(request: Request, session: SessionDep) -> Release
     WEBHOOKS.labels(result="accepted").inc()
     if target != ReleaseStatus.evaluating:
         RELEASE_TRANSITIONS.labels(target=target.value).inc()
-        if target == ReleaseStatus.blocked:
-            ACTIVE_RELEASES.dec()
     return release
 
 
 @app.post("/api/v1/releases/{release_id}/approve", response_model=ReleaseRead)
 async def approve_release(
-    release_id: uuid.UUID, payload: ApprovalCreate, session: SessionDep
+    release_id: uuid.UUID, session: SessionDep, principal: Approver
 ) -> Release:
     release = await lock_release(session, release_id)
     if release is None:
-        raise HTTPException(status_code=404, detail="release not found")
+        raise HTTPException(status_code=404, detail="Релиз не найден")
     try:
-        transition(session, release, ReleaseStatus.approved, actor=payload.actor)
+        transition(session, release, ReleaseStatus.approved, actor=principal.name)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    release.approved_by = payload.actor
+    release.approved_by = principal.name
     await session.commit()
     await session.refresh(release)
     RELEASE_TRANSITIONS.labels(target="approved").inc()
@@ -296,16 +303,16 @@ async def approve_release(
 
 @app.post("/api/v1/releases/{release_id}/deploy", response_model=ReleaseRead)
 async def deploy_release(
-    release_id: uuid.UUID, payload: DeployCreate, session: SessionDep
+    release_id: uuid.UUID, payload: DeployCreate, session: SessionDep, principal: Admin
 ) -> Release:
     release = await lock_release(session, release_id)
     if release is None:
-        raise HTTPException(status_code=404, detail="release not found")
+        raise HTTPException(status_code=404, detail="Релиз не найден")
     environment = await lock_environment(session, release.environment_id)
     if environment is None or environment.active_release_id != release.id:
-        raise HTTPException(status_code=409, detail="release does not own environment lock")
+        raise HTTPException(status_code=409, detail="Релиз не владеет блокировкой окружения")
     try:
-        transition(session, release, ReleaseStatus.canary, actor=payload.actor)
+        transition(session, release, ReleaseStatus.canary, actor=principal.name)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     release.traffic_percent = payload.canary_percent
@@ -318,16 +325,16 @@ async def deploy_release(
 
 @app.post("/api/v1/releases/{release_id}/observations", response_model=ReleaseRead)
 async def observe_canary(
-    release_id: uuid.UUID, payload: ObservationCreate, session: SessionDep
+    release_id: uuid.UUID, payload: ObservationCreate, session: SessionDep, principal: Observer
 ) -> Release:
     release = await lock_release(session, release_id)
     if release is None:
-        raise HTTPException(status_code=404, detail="release not found")
+        raise HTTPException(status_code=404, detail="Релиз не найден")
     if release.status != ReleaseStatus.canary:
-        raise HTTPException(status_code=409, detail="release is not in canary")
+        raise HTTPException(status_code=409, detail="Релиз не проходит канареечную проверку")
     environment = await lock_environment(session, release.environment_id)
-    if environment is None:
-        raise HTTPException(status_code=409, detail="environment is missing")
+    if environment is None or environment.active_release_id != release.id:
+        raise HTTPException(status_code=409, detail="Релиз не владеет окружением")
 
     decision = evaluate_canary(
         request_count=payload.request_count,
@@ -344,52 +351,56 @@ async def observe_canary(
         session,
         release,
         "canary.observed",
-        "metrics-gate",
+        principal.name,
         {**payload.model_dump(), "decision": decision.value},
     )
     if decision == CanaryDecision.promote:
-        transition(session, release, ReleaseStatus.succeeded, actor="metrics-gate")
+        transition(session, release, ReleaseStatus.succeeded, actor=principal.name)
         release.traffic_percent = 100
         environment.current_release_id = release.id
         environment.active_release_id = None
-        ACTIVE_RELEASES.dec()
-        RELEASE_TRANSITIONS.labels(target="succeeded").inc()
     elif decision == CanaryDecision.rollback:
         transition(
             session,
             release,
             ReleaseStatus.rolled_back,
-            actor="metrics-gate",
-            reason="canary thresholds exceeded",
+            actor=principal.name,
+            reason="Превышены пороги канареечной проверки",
         )
         release.traffic_percent = 0
         environment.current_release_id = release.previous_release_id
         environment.active_release_id = None
-        ACTIVE_RELEASES.dec()
-        RELEASE_TRANSITIONS.labels(target="rolled_back").inc()
     await session.commit()
     await session.refresh(release)
     CANARY_DECISIONS.labels(decision=decision.value).inc()
+    if decision == CanaryDecision.promote:
+        RELEASE_TRANSITIONS.labels(target="succeeded").inc()
+    elif decision == CanaryDecision.rollback:
+        RELEASE_TRANSITIONS.labels(target="rolled_back").inc()
     return release
 
 
 @app.post("/api/v1/releases/{release_id}/rollback", response_model=ReleaseRead)
-async def rollback_release(
-    release_id: uuid.UUID, payload: ApprovalCreate, session: SessionDep
-) -> Release:
+async def rollback_release(release_id: uuid.UUID, session: SessionDep, principal: Admin) -> Release:
     release = await lock_release(session, release_id)
     if release is None:
-        raise HTTPException(status_code=404, detail="release not found")
+        raise HTTPException(status_code=404, detail="Релиз не найден")
     environment = await lock_environment(session, release.environment_id)
     if environment is None:
-        raise HTTPException(status_code=409, detail="environment is missing")
+        raise HTTPException(status_code=409, detail="Окружение не найдено")
+    if release.status == ReleaseStatus.succeeded and (
+        environment.current_release_id != release.id or environment.active_release_id is not None
+    ):
+        raise HTTPException(status_code=409, detail="Релиз больше не является текущим")
+    if release.status == ReleaseStatus.canary and environment.active_release_id != release.id:
+        raise HTTPException(status_code=409, detail="Релиз не владеет окружением")
     try:
         transition(
             session,
             release,
             ReleaseStatus.rolled_back,
-            actor=payload.actor,
-            reason="manual rollback",
+            actor=principal.name,
+            reason="Ручной откат",
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -403,7 +414,9 @@ async def rollback_release(
 
 
 @app.get("/api/v1/releases/{release_id}/events", response_model=list[ReleaseEventRead])
-async def list_release_events(release_id: uuid.UUID, session: SessionDep) -> list[ReleaseEvent]:
+async def list_release_events(
+    release_id: uuid.UUID, session: SessionDep, principal: Reader
+) -> list[ReleaseEvent]:
     return list(
         (
             await session.scalars(
