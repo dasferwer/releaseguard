@@ -71,6 +71,24 @@ async def recalculate_gate_status(
     return target
 
 
+async def require_passed_gates(session: AsyncSession, release: Release) -> None:
+    """Повторно проверяет допуск при удерживаемой блокировке релиза."""
+    application = await session.get(Application, release.application_id)
+    if application is None:
+        raise ValueError("Приложение релиза не найдено")
+    results = {
+        result.name: result.status
+        for result in (
+            await session.scalars(select(GateResult).where(GateResult.release_id == release.id))
+        ).all()
+    }
+    if (
+        evaluate_gates(application.required_gates, results, requires_approval=False)
+        != ReleaseStatus.approved
+    ):
+        raise ValueError("Все обязательные проверки CI должны пройти успешно")
+
+
 async def lock_release(session: AsyncSession, release_id: uuid.UUID) -> Release | None:
     return await session.scalar(select(Release).where(Release.id == release_id).with_for_update())
 

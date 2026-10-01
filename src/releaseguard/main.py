@@ -53,6 +53,7 @@ from releaseguard.service import (
     lock_environment,
     lock_release,
     recalculate_gate_status,
+    require_passed_gates,
     transition,
 )
 
@@ -290,7 +291,10 @@ async def approve_release(
     release = await lock_release(session, release_id)
     if release is None:
         raise HTTPException(status_code=404, detail="Релиз не найден")
+    if release.status != ReleaseStatus.awaiting_approval:
+        raise HTTPException(status_code=409, detail="Релиз не ожидает ручного согласования")
     try:
+        await require_passed_gates(session, release)
         transition(session, release, ReleaseStatus.approved, actor=principal.name)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -312,6 +316,8 @@ async def deploy_release(
     if environment is None or environment.active_release_id != release.id:
         raise HTTPException(status_code=409, detail="Релиз не владеет блокировкой окружения")
     try:
+        # Защищаем также approved, оставшиеся от старых данных с неполными проверками.
+        await require_passed_gates(session, release)
         transition(session, release, ReleaseStatus.canary, actor=principal.name)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

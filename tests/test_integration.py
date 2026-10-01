@@ -259,3 +259,147 @@ async def test_reconciler_rolls_back_only_own_canary(client):
         async with session_factory() as session:
             environment = await session.get(Environment, UUID(environment_id))
             assert environment.active_release_id is None
+
+
+@pytest.mark.parametrize("gate_status", [None, "passed", "failed"])
+async def test_approval_cannot_bypass_missing_or_failed_gates(client, gate_status):
+    async with client:
+        _, release, _ = await make_release(client, gates=["tests", "security"])
+        if gate_status is not None:
+            gate = await send_gate(client, release["id"], "event-" + uuid4().hex, gate_status)
+            assert gate.status_code == 200
+        before = await client.get(
+            f"/api/v1/releases/{release['id']}/events", headers=headers("viewer")
+        )
+        approved = await client.post(
+            f"/api/v1/releases/{release['id']}/approve", headers=headers("approver")
+        )
+        assert approved.status_code == 409
+        deployed = await client.post(
+            f"/api/v1/releases/{release['id']}/deploy",
+            headers=headers("admin"),
+            json={"canary_percent": 10},
+        )
+        assert deployed.status_code == 409
+        current = await client.get(f"/api/v1/releases/{release['id']}", headers=headers("viewer"))
+        assert current.json()["status"] == ("blocked" if gate_status == "failed" else "evaluating")
+        assert current.json()["approved_by"] is None
+        after = await client.get(
+            f"/api/v1/releases/{release['id']}/events", headers=headers("viewer")
+        )
+        assert after.json() == before.json()
+
+
+@pytest.mark.parametrize("gate_status", [None, "passed", "failed"])
+async def test_approval_rechecks_gates_even_with_inconsistent_status(client, gate_status):
+    async with client:
+        _, release, _ = await make_release(client, gates=["tests", "security"])
+        if gate_status is not None:
+            await send_gate(client, release["id"], "event-" + uuid4().hex, gate_status)
+        # Имитация старых или вручную изменённых данных: одного статуса недостаточно.
+        async with session_factory.begin() as session:
+            await session.execute(
+                text("UPDATE releases SET status='awaiting_approval' WHERE id=:id"),
+                {"id": UUID(release["id"])},
+            )
+        approved = await client.post(
+            f"/api/v1/releases/{release['id']}/approve", headers=headers("approver")
+        )
+        assert approved.status_code == 409
+        current = await client.get(f"/api/v1/releases/{release['id']}", headers=headers("viewer"))
+        assert current.json()["status"] == "awaiting_approval"
+        assert current.json()["approved_by"] is None
+
+
+async def test_last_gate_racing_approval_preserves_admission_and_audit(client):
+    async with client:
+        for _ in range(5):
+            _, release, _ = await make_release(client, gates=["tests", "security"])
+            await send_gate(client, release["id"], "event-" + uuid4().hex)
+            gate, approved = await asyncio.gather(
+                send_gate(client, release["id"], "event-" + uuid4().hex, gate="security"),
+                client.post(
+                    f"/api/v1/releases/{release['id']}/approve", headers=headers("approver")
+                ),
+            )
+            assert gate.status_code == 200
+            assert approved.status_code in (200, 409)
+            if approved.status_code == 409:
+                approved = await client.post(
+                    f"/api/v1/releases/{release['id']}/approve", headers=headers("approver")
+                )
+            assert approved.status_code == 200 and approved.json()["status"] == "approved"
+            async with session_factory() as session:
+                results = (
+                    await session.execute(
+                        text("SELECT name,status FROM gate_results WHERE release_id=:id"),
+                        {"id": UUID(release["id"])},
+                    )
+                ).all()
+            assert set(results) == {("tests", "passed"), ("security", "passed")}
+            audit = (
+                await client.get(
+                    f"/api/v1/releases/{release['id']}/events", headers=headers("viewer")
+                )
+            ).json()
+            approvals = [
+                item
+                for item in audit
+                if item["event_type"] == "release.status_changed"
+                and item["payload"]["to"] == "approved"
+            ]
+            assert len(approvals) == 1 and approvals[0]["actor"] == "local-approver"
+            deployed = await client.post(
+                f"/api/v1/releases/{release['id']}/deploy",
+                headers=headers("admin"),
+                json={"canary_percent": 10},
+            )
+            assert deployed.status_code == 200 and deployed.json()["status"] == "canary"
+
+
+async def test_policy_engine_still_approves_after_all_gates_without_manual_approval(client):
+    async with client:
+        environment_id, release, _ = await make_release(client, gates=["tests", "security"])
+        async with session_factory.begin() as session:
+            environment = await session.get(Environment, UUID(environment_id))
+            environment.requires_approval = False
+        premature = await client.post(
+            f"/api/v1/releases/{release['id']}/approve", headers=headers("approver")
+        )
+        assert premature.status_code == 409
+        partial = await send_gate(client, release["id"], "event-" + uuid4().hex)
+        assert partial.status_code == 200 and partial.json()["status"] == "evaluating"
+        completed = await send_gate(client, release["id"], "event-" + uuid4().hex, gate="security")
+        assert completed.status_code == 200 and completed.json()["status"] == "approved"
+        assert completed.json()["approved_by"] is None
+        deployed = await client.post(
+            f"/api/v1/releases/{release['id']}/deploy",
+            headers=headers("admin"),
+            json={"canary_percent": 10},
+        )
+        assert deployed.status_code == 200 and deployed.json()["status"] == "canary"
+
+
+@pytest.mark.parametrize("gate_status", [None, "passed", "failed"])
+async def test_deploy_rechecks_gates_for_previously_approved_release(client, gate_status):
+    async with client:
+        environment_id, release, _ = await make_release(client, gates=["tests", "security"])
+        if gate_status is not None:
+            await send_gate(client, release["id"], "event-" + uuid4().hex, gate_status)
+        # Старый обход мог оставить approved без успешных проверок до обновления сервиса.
+        async with session_factory.begin() as session:
+            await session.execute(
+                text("UPDATE releases SET status='approved' WHERE id=:id"),
+                {"id": UUID(release["id"])},
+            )
+            environment = await session.get(Environment, UUID(environment_id))
+            environment.active_release_id = UUID(release["id"])
+        deployed = await client.post(
+            f"/api/v1/releases/{release['id']}/deploy",
+            headers=headers("admin"),
+            json={"canary_percent": 10},
+        )
+        assert deployed.status_code == 409
+        current = await client.get(f"/api/v1/releases/{release['id']}", headers=headers("viewer"))
+        assert current.json()["status"] == "approved"
+        assert current.json()["traffic_percent"] == 0
