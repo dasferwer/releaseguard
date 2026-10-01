@@ -62,3 +62,18 @@ def test_canary_policy(
 def test_state_machine_rejects_skipping_canary() -> None:
     with pytest.raises(ValueError, match="запрещён"):
         require_transition(ReleaseStatus.approved, ReleaseStatus.succeeded)
+
+
+@pytest.mark.parametrize("current", ["evaluating", "awaiting_approval", "approved"])
+def test_cancellation_is_terminal_before_canary(current: str) -> None:
+    cancelled = ReleaseStatus("cancelled")
+    require_transition(ReleaseStatus(current), cancelled)
+    for target in ReleaseStatus:
+        with pytest.raises(ValueError, match="запрещён"):
+            require_transition(cancelled, target)
+
+
+@pytest.mark.parametrize("current", ["blocked", "canary", "succeeded", "rolled_back"])
+def test_cancellation_cannot_replace_terminal_or_deployed_state(current: str) -> None:
+    with pytest.raises(ValueError, match="запрещён"):
+        require_transition(ReleaseStatus(current), ReleaseStatus("cancelled"))

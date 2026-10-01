@@ -9,6 +9,7 @@ class ReleaseStatus(StrEnum):
     canary = "canary"
     succeeded = "succeeded"
     rolled_back = "rolled_back"
+    cancelled = "cancelled"
 
 
 class GateStatus(StrEnum):
@@ -55,9 +56,14 @@ def require_transition(current: ReleaseStatus, target: ReleaseStatus) -> None:
             ReleaseStatus.blocked,
             ReleaseStatus.awaiting_approval,
             ReleaseStatus.approved,
+            ReleaseStatus.cancelled,
         },
-        ReleaseStatus.awaiting_approval: {ReleaseStatus.approved, ReleaseStatus.blocked},
-        ReleaseStatus.approved: {ReleaseStatus.canary},
+        ReleaseStatus.awaiting_approval: {
+            ReleaseStatus.approved,
+            ReleaseStatus.blocked,
+            ReleaseStatus.cancelled,
+        },
+        ReleaseStatus.approved: {ReleaseStatus.canary, ReleaseStatus.cancelled},
         ReleaseStatus.canary: {ReleaseStatus.succeeded, ReleaseStatus.rolled_back},
         ReleaseStatus.succeeded: {ReleaseStatus.rolled_back},
     }

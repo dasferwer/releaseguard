@@ -151,6 +151,34 @@ def main() -> None:
     )
     assert failing_release["status"] == "rolled_back", failing_release
     assert failing_release["previous_release_id"] == release["id"], failing_release
+    abandoned = request(
+        "POST",
+        f"/api/v1/environments/{environment['id']}/releases",
+        {
+            "version": "2026.09.3",
+            "artifact_digest": "sha256:" + "c" * 64,
+            "idempotency_key": f"deploy-abandoned-{suffix}",
+        },
+    )
+    cancelled = request(
+        "POST", f"/api/v1/releases/{abandoned['id']}/cancel", {"reason": "Отозван в smoke"}
+    )
+    assert cancelled["status"] == "cancelled", cancelled
+    next_release = request(
+        "POST",
+        f"/api/v1/environments/{environment['id']}/releases",
+        {
+            "version": "2026.09.4",
+            "artifact_digest": "sha256:" + "d" * 64,
+            "idempotency_key": f"deploy-after-cancel-{suffix}",
+        },
+    )
+    assert next_release["previous_release_id"] == release["id"], next_release
+    assert (
+        request("POST", f"/api/v1/releases/{abandoned['id']}/cancel", {"reason": "Повтор"})
+        == cancelled
+    )
+    request("POST", f"/api/v1/releases/{next_release['id']}/cancel", {"reason": "Smoke завершён"})
     print(
         json.dumps(
             {
@@ -158,6 +186,8 @@ def main() -> None:
                 "promoted_release_id": release["id"],
                 "rolled_back_release_id": failing_release["id"],
                 "events": len(events),
+                "cancelled_release_id": cancelled["id"],
+                "next_release_id": next_release["id"],
             },
             indent=2,
         )

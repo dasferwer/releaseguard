@@ -39,6 +39,7 @@ from releaseguard.models import (
 from releaseguard.schemas import (
     ApplicationCreate,
     ApplicationRead,
+    CancelCreate,
     DeployCreate,
     EnvironmentCreate,
     EnvironmentRead,
@@ -302,6 +303,36 @@ async def approve_release(
     await session.commit()
     await session.refresh(release)
     RELEASE_TRANSITIONS.labels(target="approved").inc()
+    return release
+
+
+@app.post("/api/v1/releases/{release_id}/cancel", response_model=ReleaseRead)
+async def cancel_release(
+    release_id: uuid.UUID, payload: CancelCreate, session: SessionDep, principal: Admin
+) -> Release:
+    release = await lock_release(session, release_id)
+    if release is None:
+        raise HTTPException(status_code=404, detail="Релиз не найден")
+    if release.status == ReleaseStatus.cancelled:
+        return release
+    environment = await lock_environment(session, release.environment_id)
+    if environment is None or environment.active_release_id != release.id:
+        raise HTTPException(status_code=409, detail="Релиз не владеет блокировкой окружения")
+    try:
+        transition(
+            session,
+            release,
+            ReleaseStatus.cancelled,
+            actor=principal.name,
+            reason=payload.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    release.traffic_percent = 0
+    environment.active_release_id = None
+    await session.commit()
+    await session.refresh(release)
+    RELEASE_TRANSITIONS.labels(target="cancelled").inc()
     return release
 
 

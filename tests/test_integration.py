@@ -403,3 +403,218 @@ async def test_deploy_rechecks_gates_for_previously_approved_release(client, gat
         current = await client.get(f"/api/v1/releases/{release['id']}", headers=headers("viewer"))
         assert current.json()["status"] == "approved"
         assert current.json()["traffic_percent"] == 0
+
+
+async def advance_before_cancel(client, release_id, desired):
+    if desired in {"awaiting_approval", "approved"}:
+        response = await send_gate(client, release_id, "event-" + uuid4().hex)
+        assert response.status_code == 200
+    if desired == "approved":
+        response = await client.post(
+            f"/api/v1/releases/{release_id}/approve", headers=headers("approver")
+        )
+        assert response.status_code == 200
+
+
+@pytest.mark.parametrize("initial", ["evaluating", "awaiting_approval", "approved"])
+async def test_cancel_releases_only_own_environment_with_audited_reason(client, initial):
+    async with client:
+        environment_id, release, _ = await make_release(client)
+        await advance_before_cancel(client, release["id"], initial)
+        response = await client.post(
+            f"/api/v1/releases/{release['id']}/cancel",
+            headers=headers("admin"),
+            json={"reason": "  Релиз отложен владельцем  ", "actor": "подставной-клиент"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "cancelled"
+        assert response.json()["state_reason"] == "Релиз отложен владельцем"
+        assert response.json()["traffic_percent"] == 0
+        async with session_factory() as session:
+            environment = await session.get(Environment, UUID(environment_id))
+            assert environment.active_release_id is None
+            assert environment.current_release_id is None
+        events = (
+            await client.get(f"/api/v1/releases/{release['id']}/events", headers=headers("viewer"))
+        ).json()
+        cancelled = [e for e in events if e["payload"].get("to") == "cancelled"]
+        assert len(cancelled) == 1 and cancelled[0]["actor"] == "local-admin"
+        assert cancelled[0]["payload"] == {
+            "from": initial,
+            "to": "cancelled",
+            "reason": "Релиз отложен владельцем",
+        }
+        _, next_release, _ = await make_release(client, environment_id)
+        repeated = await client.post(
+            f"/api/v1/releases/{release['id']}/cancel",
+            headers=headers("admin"),
+            json={"reason": "Повторный запрос"},
+        )
+        assert repeated.status_code == 200
+        assert repeated.json()["state_reason"] == "Релиз отложен владельцем"
+        async with session_factory() as session:
+            environment = await session.get(Environment, UUID(environment_id))
+            assert environment.active_release_id == UUID(next_release["id"])
+        for operation, body, role in [
+            ("approve", {}, "approver"),
+            ("deploy", {"canary_percent": 10}, "admin"),
+        ]:
+            assert (
+                await client.post(
+                    f"/api/v1/releases/{release['id']}/{operation}",
+                    headers=headers(role),
+                    json=body,
+                )
+            ).status_code == 409
+        assert (await send_gate(client, release["id"], "late-" + uuid4().hex)).status_code == 409
+        events = (
+            await client.get(f"/api/v1/releases/{release['id']}/events", headers=headers("viewer"))
+        ).json()
+        assert sum(e["payload"].get("to") == "cancelled" for e in events) == 1
+
+
+@pytest.mark.parametrize("role", ["viewer", "approver", "observer"])
+async def test_only_admin_can_cancel(client, role):
+    async with client:
+        _, release, _ = await make_release(client)
+        assert (
+            await client.post(
+                f"/api/v1/releases/{release['id']}/cancel",
+                headers=headers(role),
+                json={"reason": "Не запускать"},
+            )
+        ).status_code == 403
+
+
+@pytest.mark.parametrize(
+    "reason", [None, "", "   ", "x" * 2001], ids=["missing", "empty", "spaces", "too_long"]
+)
+async def test_cancel_requires_meaningful_bounded_reason(client, reason):
+    async with client:
+        _, release, _ = await make_release(client)
+        assert (
+            await client.post(
+                f"/api/v1/releases/{release['id']}/cancel",
+                headers=headers("admin"),
+                json={} if reason is None else {"reason": reason},
+            )
+        ).status_code == 422
+
+
+async def test_cancel_cannot_change_current_release_after_deploy(client):
+    async with client:
+        environment_id, release, _ = await make_release(client)
+        await advance_to_canary(client, release["id"])
+        assert (
+            await client.post(
+                f"/api/v1/releases/{release['id']}/cancel",
+                headers=headers("admin"),
+                json={"reason": "Уже выполняется"},
+            )
+        ).status_code == 409
+        observed = await client.post(
+            f"/api/v1/releases/{release['id']}/observations",
+            headers=headers("observer"),
+            json={"request_count": 10, "error_rate": 0, "p95_ms": 50},
+        )
+        assert observed.json()["status"] == "succeeded"
+        assert (
+            await client.post(
+                f"/api/v1/releases/{release['id']}/cancel",
+                headers=headers("admin"),
+                json={"reason": "Слишком поздно"},
+            )
+        ).status_code == 409
+        async with session_factory() as session:
+            environment = await session.get(Environment, UUID(environment_id))
+            assert environment.current_release_id == UUID(release["id"])
+            assert environment.active_release_id is None
+
+
+async def test_cancel_preserves_previous_successful_release(client):
+    async with client:
+        environment_id, current, _ = await make_release(client)
+        await advance_to_canary(client, current["id"])
+        completed = await client.post(
+            f"/api/v1/releases/{current['id']}/observations",
+            headers=headers("observer"),
+            json={"request_count": 10, "error_rate": 0, "p95_ms": 50},
+        )
+        assert completed.json()["status"] == "succeeded"
+        _, next_release, _ = await make_release(client, environment_id)
+        cancelled = await client.post(
+            f"/api/v1/releases/{next_release['id']}/cancel",
+            headers=headers("admin"),
+            json={"reason": "Сохраняем текущую версию"},
+        )
+        assert cancelled.status_code == 200
+        async with session_factory() as session:
+            environment = await session.get(Environment, UUID(environment_id))
+            assert environment.current_release_id == UUID(current["id"])
+            assert environment.active_release_id is None
+            old = await session.get(Release, UUID(current["id"]))
+            assert old.status.value == "succeeded"
+
+
+@pytest.mark.parametrize("operation", ["approve", "deploy", "webhook"])
+async def test_cancellation_race_preserves_release_and_environment(client, operation):
+    async with client:
+        environment_id, release, _ = await make_release(client)
+        initial = "approved" if operation == "deploy" else "awaiting_approval"
+        if operation != "webhook":
+            await advance_before_cancel(client, release["id"], initial)
+        cancel = client.post(
+            f"/api/v1/releases/{release['id']}/cancel",
+            headers=headers("admin"),
+            json={"reason": "Отмена в гонке"},
+        )
+        if operation == "webhook":
+            concurrent = send_gate(client, release["id"], "race-" + uuid4().hex)
+        else:
+            concurrent = client.post(
+                f"/api/v1/releases/{release['id']}/{operation}",
+                headers=headers("admin" if operation == "deploy" else "approver"),
+                json={"canary_percent": 10} if operation == "deploy" else {},
+            )
+        cancelled, other = await asyncio.gather(cancel, concurrent)
+        assert cancelled.status_code in {200, 409}
+        assert other.status_code in {200, 409}
+        state = (
+            await client.get(f"/api/v1/releases/{release['id']}", headers=headers("viewer"))
+        ).json()
+        async with session_factory() as session:
+            environment = await session.get(Environment, UUID(environment_id))
+            if state["status"] == "cancelled":
+                assert cancelled.status_code == 200
+                assert environment.active_release_id is None
+            else:
+                assert operation == "deploy" and state["status"] == "canary"
+                assert cancelled.status_code == 409 and other.status_code == 200
+                assert environment.active_release_id == UUID(release["id"])
+            assert environment.current_release_id is None
+
+
+async def test_cancel_rolls_back_when_audit_cannot_be_saved(client, monkeypatch):
+    from releaseguard import service
+
+    async with client:
+        environment_id, release, _ = await make_release(client)
+        original = service.add_event
+
+        def fail_cancel_audit(session, record, event_type, actor, payload=None):
+            if payload and payload.get("to") == "cancelled":
+                raise RuntimeError("Injected audit failure")
+            return original(session, record, event_type, actor, payload)
+
+        monkeypatch.setattr(service, "add_event", fail_cancel_audit)
+        with pytest.raises(RuntimeError, match="audit failure"):
+            await client.post(
+                f"/api/v1/releases/{release['id']}/cancel",
+                headers=headers("admin"),
+                json={"reason": "Откатить при ошибке"},
+            )
+        async with session_factory() as session:
+            current = await session.get(Release, UUID(release["id"]))
+            environment = await session.get(Environment, UUID(environment_id))
+            assert current.status.value == "evaluating"
+            assert environment.active_release_id == UUID(release["id"])

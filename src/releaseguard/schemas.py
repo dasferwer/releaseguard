@@ -89,6 +89,18 @@ class DeployCreate(BaseModel):
     canary_percent: int = Field(default=10, ge=1, le=50)
 
 
+class CancelCreate(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def meaningful_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Укажите причину отмены")
+        return value
+
+
 class ObservationCreate(BaseModel):
     request_count: int = Field(ge=0)
     error_rate: float = Field(ge=0, le=1, allow_inf_nan=False)
