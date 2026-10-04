@@ -31,6 +31,7 @@ RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
 COPY pyproject.toml ./
 COPY tests ./tests
 USER app
+ENTRYPOINT ["./scripts/test-entrypoint.sh"]
 CMD ["pytest"]
 
 FROM runtime AS final

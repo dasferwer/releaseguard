@@ -1,3 +1,14 @@
+# ruff: noqa: E402
+import pytest
+
+from releaseguard.test_safety import UnsafeTestEnvironment, ensure_test_environment
+
+# Проверяем окружение раньше settings/engine и регистрации любых fixtures.
+try:
+    ensure_test_environment()
+except UnsafeTestEnvironment as exc:
+    raise pytest.UsageError(str(exc)) from None
+
 import asyncio
 import hashlib
 import hmac
@@ -6,7 +17,6 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 import httpx
-import pytest
 import pytest_asyncio
 from sqlalchemy import text
 

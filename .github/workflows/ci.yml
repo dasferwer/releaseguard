@@ -24,7 +24,10 @@ jobs:
       - run: uv run mypy src
       - run: uv run pytest
       - run: docker compose config --quiet
+      - run: uv run pytest --noconftest -p no:cacheprovider tests/test_fixture_safety.py
       - run: docker compose --profile test build test
+      - name: Проверка защиты тестового образа
+        run: uv run pytest -q scripts/test_test_entrypoint.py
       - run: docker compose --profile test run --rm test
       - run: helm lint deploy/helm/releaseguard
       - run: helm template test deploy/helm/releaseguard > /tmp/releaseguard.yaml

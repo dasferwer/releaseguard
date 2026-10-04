@@ -96,6 +96,7 @@ services:
       context: .
       target: test
     environment:
+      TESTING: "true"
       <<: *app-environment
       DATABASE_URL: postgresql+asyncpg://releaseguard:releaseguard@database-test:5432/releaseguard_test
       API_CLIENTS: '{"local-admin":{"key":"local-admin-key-change-me","role":"admin"},"local-approver":{"key":"local-approver-key-change-me","role":"approver"},"local-observer":{"key":"local-observer-key-change-me","role":"observer"},"local-viewer":{"key":"local-viewer-key-change-me","role":"viewer"}}'
