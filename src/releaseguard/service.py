@@ -4,7 +4,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from releaseguard.domain import ReleaseStatus, evaluate_gates, require_transition
+from releaseguard.domain import ReleaseStatus, evaluate_gates, gate_reason, require_transition
 from releaseguard.models import Application, Environment, GateResult, Release, ReleaseEvent
 
 
@@ -64,10 +64,27 @@ async def recalculate_gate_status(
         results,
         requires_approval=environment.requires_approval,
     )
+    reason = gate_reason(
+        application.required_gates, results, requires_approval=environment.requires_approval
+    )
+    add_event(
+        session,
+        release,
+        "release.gates_evaluated",
+        "policy-engine",
+        {
+            "required_gates": application.required_gates,
+            "results": {name: result.value for name, result in results.items()},
+            "requires_approval": environment.requires_approval,
+            "decision": target.value,
+            "reason": reason,
+        },
+    )
     if target != release.status:
-        transition(session, release, target, actor="policy-engine")
+        transition(session, release, target, actor="policy-engine", reason=reason)
         if target == ReleaseStatus.blocked:
             environment.active_release_id = None
+    release.state_reason = reason
     return target
 
 

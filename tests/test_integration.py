@@ -180,7 +180,7 @@ async def test_roles_webhook_and_concurrent_idempotency(client):
         events = await client.get(
             f"/api/v1/releases/{release['id']}/events", headers=headers("viewer")
         )
-        assert events.status_code == 200 and len(events.json()) == 3
+        assert events.status_code == 200 and len(events.json()) == 4
         await advance_existing_release(client, release["id"])
         audit = (
             await client.get(f"/api/v1/releases/{release['id']}/events", headers=headers("viewer"))
@@ -628,3 +628,61 @@ async def test_cancel_rolls_back_when_audit_cannot_be_saved(client, monkeypatch)
             environment = await session.get(Environment, UUID(environment_id))
             assert current.status.value == "evaluating"
             assert environment.active_release_id == UUID(release["id"])
+
+
+async def test_operator_journal_explains_missing_gates_and_canary_decisions(client):
+    _, release, _ = await make_release(client, gates=["tests", "security"])
+    rid = release["id"]
+    first = await send_gate(client, rid, "operator-" + uuid4().hex)
+    assert first.json()["status"] == "evaluating"
+    assert first.json()["state_reason"] == "Ожидаются проверки CI: security"
+    last = await send_gate(client, rid, "operator-" + uuid4().hex, gate="security")
+    assert last.json()["state_reason"] == "Проверки CI пройдены; ожидается ручное согласование"
+    before = (await client.get(f"/api/v1/releases/{rid}/events", headers=headers("viewer"))).json()
+    assert before[-1]["payload"]["reason"] == last.json()["state_reason"]
+    snapshots = [e["payload"] for e in before if e["event_type"] == "release.gates_evaluated"]
+    assert [s["decision"] for s in snapshots] == ["evaluating", "awaiting_approval"]
+    assert snapshots[-1]["results"] == {"tests": "passed", "security": "passed"}
+    approved = await client.post(f"/api/v1/releases/{rid}/approve", headers=headers("approver"))
+    assert approved.json()["state_reason"] == "Ручное согласование получено"
+    deployed = await client.post(
+        f"/api/v1/releases/{rid}/deploy", headers=headers("admin"), json={"canary_percent": 10}
+    )
+    assert deployed.status_code == 200
+    observation = {"request_count": 3, "error_rate": 0, "p95_ms": 100}
+    waiting = await client.post(
+        f"/api/v1/releases/{rid}/observations", headers=headers("observer"), json=observation
+    )
+    assert waiting.json()["status"] == "canary"
+    assert waiting.json()["state_reason"] == "Недостаточно запросов: 3 из 10"
+    good = await client.post(
+        f"/api/v1/releases/{rid}/observations",
+        headers=headers("observer"),
+        json={**observation, "request_count": 10},
+    )
+    assert good.json()["status"] == "succeeded"
+    assert good.json()["state_reason"] == "Достаточно запросов; канареечные пороги соблюдены"
+    events = (await client.get(f"/api/v1/releases/{rid}/events", headers=headers("viewer"))).json()
+    observed = [e["payload"] for e in events if e["event_type"] == "canary.observed"]
+    assert [e["decision"] for e in observed] == ["continue", "promote"]
+    assert observed[0]["thresholds"]["min_requests"] == 10
+    assert observed[0]["reason"] == waiting.json()["state_reason"]
+
+
+async def test_operator_failed_gate_reason_survives_rejected_late_webhook(client):
+    env, release, _ = await make_release(client, gates=["tests", "security"])
+    rid = release["id"]
+    failed = await send_gate(
+        client, rid, "operator-" + uuid4().hex, status="failed", gate="security"
+    )
+    assert failed.json()["status"] == "blocked"
+    assert failed.json()["state_reason"] == "Провалены проверки CI: security"
+    events = (await client.get(f"/api/v1/releases/{rid}/events", headers=headers("viewer"))).json()
+    assert events[-1]["payload"]["reason"] == failed.json()["state_reason"]
+    late = await send_gate(client, rid, "operator-" + uuid4().hex)
+    assert late.status_code == 409
+    assert (
+        await client.get(f"/api/v1/releases/{rid}/events", headers=headers("viewer"))
+    ).json() == events
+    _, successor, _ = await make_release(client, environment_id=env)
+    assert successor["id"] != rid

@@ -69,3 +69,40 @@ def require_transition(current: ReleaseStatus, target: ReleaseStatus) -> None:
     }
     if target not in allowed.get(current, set()):
         raise ValueError(f"Переход {current.value} → {target.value} запрещён")
+
+
+def gate_reason(
+    required_gates: list[str], results: dict[str, GateStatus], *, requires_approval: bool
+) -> str:
+    failed = [name for name in required_gates if results.get(name) == GateStatus.failed]
+    missing = [name for name in required_gates if name not in results]
+    if failed:
+        return "Провалены проверки CI: " + ", ".join(failed)
+    if missing:
+        return "Ожидаются проверки CI: " + ", ".join(missing)
+    return (
+        "Проверки CI пройдены; ожидается ручное согласование"
+        if requires_approval
+        else "Проверки CI пройдены; ручное согласование не требуется"
+    )
+
+
+def canary_reason(
+    *,
+    request_count: int,
+    error_rate: float,
+    p95_ms: int,
+    min_requests: int,
+    max_error_rate: float,
+    max_p95_ms: int,
+) -> str:
+    exceeded = []
+    if error_rate > max_error_rate:
+        exceeded.append("error_rate")
+    if p95_ms > max_p95_ms:
+        exceeded.append("p95_ms")
+    if exceeded:
+        return "Превышены канареечные пороги: " + ", ".join(exceeded)
+    if request_count < min_requests:
+        return f"Недостаточно запросов: {request_count} из {min_requests}"
+    return "Достаточно запросов; канареечные пороги соблюдены"

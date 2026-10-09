@@ -17,7 +17,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from releaseguard.auth import Admin, Approver, Observer, Reader
 from releaseguard.config import get_settings
 from releaseguard.db import engine, get_session
-from releaseguard.domain import CanaryDecision, ReleaseStatus, evaluate_canary
+from releaseguard.domain import CanaryDecision, ReleaseStatus, canary_reason, evaluate_canary
 from releaseguard.metrics import (
     ACTIVE_RELEASES,
     CANARY_DECISIONS,
@@ -296,7 +296,13 @@ async def approve_release(
         raise HTTPException(status_code=409, detail="Релиз не ожидает ручного согласования")
     try:
         await require_passed_gates(session, release)
-        transition(session, release, ReleaseStatus.approved, actor=principal.name)
+        transition(
+            session,
+            release,
+            ReleaseStatus.approved,
+            actor=principal.name,
+            reason="Ручное согласование получено",
+        )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     release.approved_by = principal.name
@@ -349,7 +355,13 @@ async def deploy_release(
     try:
         # Защищаем также approved, оставшиеся от старых данных с неполными проверками.
         await require_passed_gates(session, release)
-        transition(session, release, ReleaseStatus.canary, actor=principal.name)
+        transition(
+            session,
+            release,
+            ReleaseStatus.canary,
+            actor=principal.name,
+            reason="Начато наблюдение канареечных метрик",
+        )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     release.traffic_percent = payload.canary_percent
@@ -381,6 +393,15 @@ async def observe_canary(
         max_error_rate=environment.max_error_rate,
         max_p95_ms=environment.max_p95_ms,
     )
+    reason = canary_reason(
+        request_count=payload.request_count,
+        error_rate=payload.error_rate,
+        p95_ms=payload.p95_ms,
+        min_requests=environment.min_requests,
+        max_error_rate=environment.max_error_rate,
+        max_p95_ms=environment.max_p95_ms,
+    )
+    release.state_reason = reason
     session.add(
         CanaryObservation(release_id=release.id, decision=decision.value, **payload.model_dump())
     )
@@ -389,10 +410,19 @@ async def observe_canary(
         release,
         "canary.observed",
         principal.name,
-        {**payload.model_dump(), "decision": decision.value},
+        {
+            **payload.model_dump(),
+            "decision": decision.value,
+            "reason": reason,
+            "thresholds": {
+                "min_requests": environment.min_requests,
+                "max_error_rate": environment.max_error_rate,
+                "max_p95_ms": environment.max_p95_ms,
+            },
+        },
     )
     if decision == CanaryDecision.promote:
-        transition(session, release, ReleaseStatus.succeeded, actor=principal.name)
+        transition(session, release, ReleaseStatus.succeeded, actor=principal.name, reason=reason)
         release.traffic_percent = 100
         environment.current_release_id = release.id
         environment.active_release_id = None
@@ -402,7 +432,7 @@ async def observe_canary(
             release,
             ReleaseStatus.rolled_back,
             actor=principal.name,
-            reason="Превышены пороги канареечной проверки",
+            reason=reason,
         )
         release.traffic_percent = 0
         environment.current_release_id = release.previous_release_id
